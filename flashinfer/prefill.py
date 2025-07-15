@@ -191,9 +191,11 @@ def get_single_prefill_module(backend, *args):
 
 
 @functools.cache
-def get_batch_prefill_module(backend, *args):
+def get_batch_prefill_module(backend, *args, jit_args=None):
     uri = get_batch_prefill_uri(backend, *args)
-    module = gen_batch_prefill_module(backend, *args).build_and_load()
+    if jit_args is not None:
+        uri = f"{uri}_{jit_args[0]}"
+    module = gen_batch_prefill_module(backend, *args, jit_args=jit_args).build_and_load()
     plan_func = module.plan.default
     ragged_run_func = module.ragged_run.default
     paged_run_func = module.paged_run.default
@@ -364,6 +366,7 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        *jit_args: Optional[tuple],
     ) -> None:
         if backend == "fa2":
             assert not is_float8(q)
@@ -390,6 +393,7 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                *jit_args,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -420,6 +424,7 @@ def get_batch_prefill_module(backend, *args):
                     maybe_max_item_len_ptr,
                     logits_soft_cap,
                     sm_scale,
+                    *jit_args,
                     token_pos_in_items_len,
                 )
             else:
@@ -444,6 +449,7 @@ def get_batch_prefill_module(backend, *args):
                     scale_k,
                     scale_v,
                     sm_scale,
+                    *jit_args,
                 )
         return o
 
@@ -1166,13 +1172,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         _check_kv_layout(kv_layout)
 
-        if jit_args is not None:
-            self._jit_module = get_batch_prefill_jit_module(
-                jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
-            )
-        else:
-            self._jit_module = None
+        # jit_args update
+        self.jit_args = jit_args
+        self._jit_module = None
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -1523,7 +1525,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
                     use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
+                    self._custom_mask_buf is not None, # use_custom_mask
                     q_data_type,
                     kv_data_type,
                 )
@@ -1540,9 +1542,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
             )
-
+            jit_args = tuple(self.jit_args) if self.jit_args is not None else None
             self._cached_module = get_batch_prefill_module(
-                self._backend, *get_module_args
+                self._backend, *get_module_args , jit_args=jit_args
             )
 
         if self._backend == "fa3":
@@ -1703,6 +1705,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        
+        if args and args[0]:
+            paged_s_cache, paged_w_cache = _unpack_paged_kv_cache(args[0], self._kv_layout)
+            args = [paged_s_cache, paged_w_cache] + list(args[1:])
+        
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -1793,27 +1800,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
             TensorLayout[self._kv_layout].value,
             window_left,
             enable_pdl,
+        ] + [
+            self._custom_mask_buf,
+            self._mask_indptr_buf,
+            _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+            self._prefix_len_ptr,
+            self._token_pos_in_items_ptr,
+            self._max_item_len_ptr,
+            logits_soft_cap,
+            sm_scale,
+            None,  # scale_q, not supported yet
+            None,  # scale_k
+            None,  # scale_v
+            rope_scale,
+            rope_theta,
+            self._token_pos_in_items_len,
         ]
 
-        if self._jit_module is not None:
+        if self.jit_args is not None:
             run_args.extend(list(args))
-        else:
-            run_args += [
-                self._custom_mask_buf,
-                self._mask_indptr_buf,
-                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-                self._prefix_len_ptr,
-                self._token_pos_in_items_ptr,
-                self._max_item_len_ptr,
-                logits_soft_cap,
-                sm_scale,
-                None,  # scale_q, not supported yet
-                None,  # scale_k
-                None,  # scale_v
-                rope_scale,
-                rope_theta,
-                self._token_pos_in_items_len,
-            ]
 
         self._cached_module.paged_run(*run_args)
         if v_scale is not None:
@@ -1827,6 +1832,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        paged_sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        ext_dim: Optional[int] = None,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
@@ -1847,7 +1854,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run_return_lse(q, paged_kv_cache, k_scale, v_scale)
+        return self.run_return_lse(q, paged_kv_cache, paged_sw_cache, ext_dim, k_scale=k_scale, v_scale=v_scale)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""

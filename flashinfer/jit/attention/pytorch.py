@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List
+from typing import List, Optional
 
 import jinja2
 import torch
@@ -758,6 +758,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    jit_args: Optional[tuple] = None,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -772,6 +773,8 @@ def gen_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
     )
+    if jit_args is not None:
+        uri = f"{uri}_{jit_args[0]}"
 
     # use `fp8_enabled` flag to use separate kernel template
     # this is used for fp8 tensor core computation
@@ -829,6 +832,11 @@ def gen_batch_prefill_module(
             additional_scalar_dtypes = ["double"]
             variant_name = "DefaultFP8Attention"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
+    if jit_args is not None:
+        additional_tensor_names += list(jit_args[1])
+        additional_tensor_dtypes += list(jit_args[2])
+        additional_scalar_names = list(jit_args[3]) + additional_scalar_names
+        additional_scalar_dtypes = list(jit_args[4]) + additional_scalar_dtypes
 
     return gen_customize_batch_prefill_module(
         backend,
@@ -850,6 +858,7 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        jit_args=jit_args,
     )
 
 
@@ -1250,6 +1259,7 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    jit_args: Optional[tuple] = None,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1277,6 +1287,11 @@ def gen_customize_batch_prefill_module(
                 additional_scalar_dtypes,
             )
         )
+        if jit_args is not None:
+            jit_args
+            kwargs |= {
+                "custom_pre_defines": "#define ENABLE_CUSTOM_VARIANT 1",
+            }
 
         with open(
             jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_customize_config.jinja"

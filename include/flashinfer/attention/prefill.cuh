@@ -37,6 +37,22 @@
 #include "cascade.cuh"
 #include "mask.cuh"
 #include "variants.cuh"
+
+
+// 辅助函数：为 float 类型实现 atomicMax
+__device__ __forceinline__ float atomicMax(float* address, float val) {
+    int* address_as_int = (int*)address;
+    int old = *address_as_int, assumed;
+
+    do {
+        assumed = old;
+        // __int_as_float 和 __float_as_int 是CUDA内置的位转换函数，效率极高
+        old = atomicCAS(address_as_int, assumed, __float_as_int(fmaxf(__int_as_float(assumed), val)));
+    } while (assumed != old);
+
+    return __int_as_float(old);
+}
+
 namespace flashinfer {
 
 DEFINE_HAS_MEMBER(maybe_q_rope_offset)
@@ -2110,6 +2126,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     float d[NUM_MMA_Q][2];
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
+    #if defined(ENABLE_CUSTOM_VARIANT)
+      const uint32_t ext_dim = params.ext_dim;
+      const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
+      const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
+      // 1. 在共享内存中声明一个用于块内归约的数组
+      // CTA_TILE_KV 是一个KV-tile中的token数量
+      __shared__ float smem_max_scores[CTA_TILE_KV];
+    #endif
+
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
       const float rope_rcp_theta = params.rope_rcp_theta;
@@ -2262,6 +2287,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                                      : 0)
               : 0;
       packed_page_iter_base += (1 + prefetch_skip_step) * CTA_TILE_KV;
+
+    #if defined(ENABLE_CUSTOM_VARIANT)
+      // 2. 初始化共享内存
+      // 每个线程从自己的唯一ID开始，以整个块的大小为步长进行遍历
+      // 这样就保证了每个 'i' 在第一次被访问时，只会被一个唯一的线程写入。
+      const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
+      const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
+      #pragma unroll
+      for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+          smem_max_scores[i] = -INFINITY;
+      }
+      // 3. 同步，确保所有写入都已完成
+      block.sync(); // __syncthreads();
+    #endif
+
 #pragma unroll
       for (uint32_t i = 0;
            i < NUM_MMA_KV * (SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q; ++i) {
@@ -2330,6 +2370,56 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         }
       }
 
+      /*********************************************************************************
+       * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
+       *********************************************************************************/
+      #if defined(ENABLE_CUSTOM_VARIANT)
+      {
+        // 3. 每个线程遍历自己的s_frag, 将分数聚合到共享内存
+        //    首先，获取当前线程所属的warp在KV维度上的ID
+        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
+        assert(local_kv_idx < CTA_TILE_KV);
+
+        #pragma unroll
+        for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+        #pragma unroll
+            for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
+        #pragma unroll
+                for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+                    
+                    // ======================== [修正的核心代码] ========================
+                    // 计算当前分数对应的KV-token在当前KV-tile内的局部索引。
+                    // 这个公式组合了warp的ID、MMA块的ID以及线程/寄存器的ID，
+                    // 得到一个在 [0, CTA_TILE_KV - 1] 范围内的唯一索引。
+                    const uint32_t local_kv_idx = warp_idx_kv_bias + 
+                                                  (mma_kv * 16) + 
+                                                  (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
+                    // =================================================================
+
+                    // 从寄存器中获取已经经过缩放和掩码的logits分数
+                    const float score = s_frag[mma_q][mma_kv][reg_id];
+
+                    // 关键：在共享内存上执行原子Max操作，这非常快
+                    // 只有当分数不是负无穷（即未被掩码）时才进行操作
+                    if (score > -INFINITY) {
+                        // 使用计算出的局部索引来更新共享内存中正确的位置
+                        atomicMax(&smem_max_scores[local_kv_idx], score);
+                    }
+                }
+            }
+        }
+        // // 确保所有线程的atomicMax操作都已完成，这样smem_max_scores中的值才是最终的块内最大值
+        // block.sync();
+
+        // 在这里，smem_max_scores[i] 中就保存了当前KV-tile中第i个token，
+        // 与当前Q-tile中所有token交互后的最大分数。
+        // 接下来可以将其写入全局内存的临时缓冲区。
+      }
+      #endif
+      /*********************************************************************************
+       * END: CUSTOM MODIFICATION
+       *********************************************************************************/
+
       // compute m,d states in online softmax
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
@@ -2349,6 +2439,28 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                      (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
                                      warp_idx, lane_idx);
       cp_async::commit_group();
+      
+      #if defined(ENABLE_CUSTOM_VARIANT)
+        // 将 tile 上的 score 更新到 全局内存中
+        float* s_cache_ptr = params.s_cache; 
+        // float* w_cache_ptr = params.w_cache; 
+        if (s_cache_ptr != nullptr) {
+          #pragma unroll
+          for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+            if (i < chunk_size) {
+              uint32_t page_iter, entry_idx;
+              paged_kv.page_size.divmod(chunk_start + iter * CTA_TILE_KV + i, page_iter, entry_idx);
+              page_iter += paged_kv.indptr[request_idx];
+              const uint32_t s_offset = paged_kv.protective_get_kv_offset(
+                  page_iter, kv_head_idx, entry_idx, 0, last_indptr) / HEAD_DIM_QK * ext_dim; // s_cache_dim = 1
+              atomicMax(&s_cache_ptr[s_offset], smem_max_scores[i]);
+            }
+            smem_max_scores[i] = -INFINITY; // 重置共享内存中的分数，以便下一次迭代使用
+          }
+        }
+        // 3. 同步，确保所有写入都已完成
+        block.sync(); // __syncthreads();
+      #endif
     }
     cp_async::wait_group<0>();
     block.sync();

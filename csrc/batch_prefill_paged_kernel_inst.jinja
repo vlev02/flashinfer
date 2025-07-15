@@ -1,5 +1,5 @@
-#include <flashinfer/attention/prefill.cuh>
 #include "batch_prefill_config.inc"
+#include <flashinfer/attention/prefill.cuh>
 
 namespace flashinfer {
 
@@ -12,3 +12,4 @@ template cudaError_t BatchPrefillWithPagedKVCacheDispatched<
 {% endfor %}
 
 };  // namespace flashinfer
+ 

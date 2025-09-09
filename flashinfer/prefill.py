@@ -237,6 +237,7 @@ def get_batch_prefill_module(backend, *args, jit_args=None):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        *jit_args: Optional[tuple],
     ) -> None:
         if backend == "fa2":
             ragged_run_func(
@@ -260,6 +261,7 @@ def get_batch_prefill_module(backend, *args, jit_args=None):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                *jit_args,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -267,6 +269,7 @@ def get_batch_prefill_module(backend, *args, jit_args=None):
                 token_pos_in_items_len,
             )
         else:
+            raise NotImplementedError # add by sean
             ragged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -401,6 +404,7 @@ def get_batch_prefill_module(backend, *args, jit_args=None):
                 token_pos_in_items_len,
             )
         else:
+            raise NotImplementedError # add by sean
             if not is_float8(q):
                 paged_run_func(
                     float_workspace_buffer,
@@ -2026,13 +2030,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             otherwise, the wrapper will use default attention implementation.
         """
         _check_kv_layout(kv_layout)
-        if jit_args is not None:
-            self._jit_module = get_batch_prefill_jit_module(
-                jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
-            )
-        else:
-            self._jit_module = None
+
+        # jit_args update
+        self.jit_args = jit_args
+        self._jit_module = None
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -2332,8 +2333,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "cutlass":
                 self._cached_module = get_fmha_module(*get_module_args)
             else:
+                jit_args = tuple(self.jit_args) if self.jit_args is not None else None
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend, *get_module_args, jit_args=jit_args
                 )
 
         if self._backend == "cutlass":
@@ -2376,6 +2378,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        ext_dim: Optional[int] = None,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
@@ -2394,7 +2398,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(q, k, v)
+        return self.run(q, k, v, sw_cache, ext_dim)
 
     @overload
     def run(
@@ -2464,6 +2468,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        if args and args[0]:
+            paged_s_cache, paged_w_cache = _unpack_paged_kv_cache(args[0], self._kv_layout)
+            args = [paged_s_cache, paged_w_cache] + list(args[1:])
+        
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         _check_cached_qkv_data_type(
@@ -2548,23 +2556,22 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             TensorLayout[self._kv_layout].value,
             window_left,
             enable_pdl,
+        ] + [
+            self._custom_mask_buf,
+            self._mask_indptr_buf,
+            _get_cache_alibi_slopes_buf(q.shape[1], self.device),
+            self._prefix_len_ptr,
+            self._token_pos_in_items_ptr,
+            self._max_item_len_ptr,
+            logits_soft_cap,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            self._token_pos_in_items_len,
         ]
-        if self._jit_module is not None:
+
+        if self.jit_args is not None:
             run_args.extend(list(args))
-        else:
-            run_args += [
-                self._custom_mask_buf,
-                self._mask_indptr_buf,
-                _get_cache_alibi_slopes_buf(q.shape[1], self.device),
-                self._prefix_len_ptr,
-                self._token_pos_in_items_ptr,
-                self._max_item_len_ptr,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                self._token_pos_in_items_len,
-            ]
 
         self._cached_module.ragged_run(*run_args)
         return (out, lse) if return_lse else out
@@ -2576,6 +2583,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        ext_dim: Optional[int] = None,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
@@ -2594,7 +2603,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run_return_lse(q, k, v)
+        return self.run_return_lse(q, k, v, sw_cache, ext_dim)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""

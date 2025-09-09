@@ -1288,7 +1288,6 @@ def gen_customize_batch_prefill_module(
             )
         )
         if jit_args is not None:
-            jit_args
             kwargs |= {
                 "custom_pre_defines": "#define ENABLE_CUSTOM_VARIANT 1",
             }

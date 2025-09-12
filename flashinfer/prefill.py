@@ -1600,6 +1600,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        *comp_args,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
@@ -1620,14 +1621,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
+        return self.run(q, paged_kv_cache, *comp_args, k_scale=k_scale, v_scale=v_scale)
 
     @overload
     def run(
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        *args,
+        *comp_args,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
@@ -1641,7 +1642,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        *args,
+        *comp_args,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
@@ -1654,7 +1655,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        *args,
+        *comp_args,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
@@ -1710,9 +1711,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         
-        if args and args[0]:
-            paged_s_cache, paged_w_cache = _unpack_paged_kv_cache(args[0], self._kv_layout)
-            args = [paged_s_cache, paged_w_cache] + list(args[1:])
+        if comp_args and comp_args[0]:
+            paged_s_cache, paged_w_cache = _unpack_paged_kv_cache(comp_args[0], self._kv_layout)
+            args = [paged_s_cache, paged_w_cache] + list(comp_args[1:])
         
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -1836,8 +1837,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        paged_sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
-        ext_dim: Optional[int] = None,
+        # paged_sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        # ext_dim: Optional[int] = None,
+        *comp_args,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
@@ -1858,7 +1860,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run_return_lse(q, paged_kv_cache, paged_sw_cache, ext_dim, k_scale=k_scale, v_scale=v_scale)
+        return self.run_return_lse(q, paged_kv_cache, *comp_args, k_scale=k_scale, v_scale=v_scale)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
@@ -2378,8 +2380,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
-        ext_dim: Optional[int] = None,
+        # sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        # ext_dim: Optional[int] = None,
+        *comp_args,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
@@ -2398,7 +2401,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(q, k, v, sw_cache, ext_dim)
+        return self.run(q, k, v, *comp_args)
 
     @overload
     def run(
@@ -2406,7 +2409,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *args,
+        *comp_args,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
@@ -2419,7 +2422,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *args,
+        *comp_args,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
@@ -2431,7 +2434,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *args,
+        *comp_args,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -2468,9 +2471,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
-        if args and args[0]:
-            paged_s_cache, paged_w_cache = _unpack_paged_kv_cache(args[0], self._kv_layout)
-            args = [paged_s_cache, paged_w_cache] + list(args[1:])
+        if comp_args and comp_args[0]:
+            paged_s_cache, paged_w_cache = _unpack_paged_kv_cache(comp_args[0], self._kv_layout)
+            args = [paged_s_cache, paged_w_cache] + list(comp_args[1:])
         
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
@@ -2583,8 +2586,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
-        ext_dim: Optional[int] = None,
+        # sw_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
+        # ext_dim: Optional[int] = None,
+        *comp_args,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
@@ -2603,7 +2607,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run_return_lse(q, k, v, sw_cache, ext_dim)
+        return self.run_return_lse(q, k, v, *comp_args)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""

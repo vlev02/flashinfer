@@ -200,9 +200,11 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 
 
 @functools.cache
-def get_batch_decode_module(*args):
+def get_batch_decode_module(*args, jit_args=None):
     uri = get_batch_decode_uri(*args)
-    mod = gen_batch_decode_module(*args).build_and_load()
+    if jit_args is not None:
+        uri = f"{uri}_{jit_args[0]}"
+    mod = gen_batch_decode_module(*args, jit_args=jit_args).build_and_load()
     plan_func = mod.plan.default
     run_func = mod.run.default
 
@@ -239,6 +241,7 @@ def get_batch_decode_module(*args):
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
+        *jit_args: Optional[tuple],
     ) -> None:
         run_func(
             float_workspace_buffer,
@@ -255,6 +258,7 @@ def get_batch_decode_module(*args):
             kv_layout_code,
             window_left,
             enable_pdl,
+            *jit_args,
             alibi_slopes,
             logits_soft_cap,
             sm_scale,
@@ -283,6 +287,7 @@ def get_batch_decode_module(*args):
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
+        *jit_args: Optional[tuple],
     ) -> None:
         pass
 
@@ -696,21 +701,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         _check_kv_layout(kv_layout)
 
-        if jit_args is not None:
-            if use_tensor_cores:
-                self._jit_module = get_batch_prefill_jit_module(
-                    jit_args[0],
-                    gen_customize_batch_prefill_module(
-                        "fa2", *jit_args
-                    ).build_and_load(),
-                )
-            else:
-                self._jit_module = get_batch_decode_jit_module(
-                    jit_args[0],
-                    gen_customize_batch_decode_module(*jit_args).build_and_load(),
-                )
-        else:
-            self._jit_module = None
+        # jit_args update
+        self.jit_args = jit_args
+        self._jit_module = None
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -928,6 +921,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
+                jit_args = tuple(self.jit_args) if self.jit_args is not None else None
                 self._cached_module = get_batch_prefill_module(
                     "fa2",
                     q_data_type,
@@ -940,6 +934,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    jit_args=jit_args,
                 )
 
             self._plan_info = self._cached_module.plan(
@@ -960,10 +955,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 False,  # causal
             )
         else:
+            if self.jit_args is not None:
+                raise NotImplementedError("compression variant is not supported in non-tensor-core mode")
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
-                self._cached_module = get_batch_decode_module(
+                get_module_args = (
                     q_data_type,
                     kv_data_type,
                     q_data_type,
@@ -973,6 +970,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
+                )
+                jit_args = tuple(self.jit_args) if self.jit_args is not None else None
+                self._cached_module = get_batch_decode_module(
+                    *get_module_args, jit_args=jit_args
                 )
 
             self._plan_info = self._cached_module.plan(
@@ -1006,6 +1007,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        *comp_args,
         pos_encoding_mode: str = "NONE",
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
@@ -1024,7 +1026,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run(
-            q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+            q, paged_kv_cache, *comp_args, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
         )
 
     @overload
@@ -1032,7 +1034,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        *args,
+        *comp_args,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -1047,7 +1049,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        *args,
+        *comp_args,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -1061,7 +1063,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        *args,
+        *comp_args,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -1089,7 +1091,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
-        *args
+        *comp_args
             Additional arguments for the custom kernel.
         q_scale : Optional[float]
             The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
@@ -1118,6 +1120,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        
+        if comp_args and comp_args[0]:
+            paged_s_cache, paged_w_cache = _unpack_paged_kv_cache(comp_args[0], self._kv_layout)
+            args = [paged_s_cache, paged_w_cache] + list(comp_args[1:])
+        
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -1176,27 +1183,25 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
+            ] + [
+                None,  # packed_custom_mask
+                None,  # mask_indptr_buf
+                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                None,  # maybe_prefix_len_ptr
+                None,  # maybe_token_pos_in_items_ptr
+                None,  # maybe_max_item_len_ptr
+                logits_soft_cap,
+                sm_scale,
+                None,  # scale_q, not supported yet
+                None,  # scale_k
+                None,  # scale_v
+                rope_scale,
+                rope_theta,
+                0,  # token_pos_in_items_len
             ]
 
-            if self._jit_module is not None:
+            if self.jit_args is not None:
                 run_args.extend(list(args))
-            else:
-                run_args += [
-                    None,  # packed_custom_mask
-                    None,  # mask_indptr_buf
-                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-                    None,  # maybe_prefix_len_ptr
-                    None,  # maybe_token_pos_in_items_ptr
-                    None,  # maybe_max_item_len_ptr
-                    logits_soft_cap,
-                    sm_scale,
-                    None,  # scale_q, not supported yet
-                    None,  # scale_k
-                    None,  # scale_v
-                    rope_scale,
-                    rope_theta,
-                    0,  # token_pos_in_items_len
-                ]
 
             self._cached_module.paged_run(*run_args)
         else:
@@ -1215,18 +1220,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
+            ] + [
+                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                logits_soft_cap,
+                sm_scale,
+                rope_scale,
+                rope_theta,
             ]
 
-            if self._jit_module is not None:
+            if self.jit_args is not None:
                 run_args.extend(list(args))
-            else:
-                run_args += [
-                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                ]
 
             self._cached_module.run(*run_args)
         if v_scale is not None:
@@ -1238,6 +1241,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: torch.Tensor,
+        *comp_args,
         pos_encoding_mode: str = "NONE",
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
@@ -1258,6 +1262,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return self.run(
             q,
             paged_kv_cache,
+            *comp_args,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,

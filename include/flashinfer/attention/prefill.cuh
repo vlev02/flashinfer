@@ -1815,6 +1815,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
     #if defined(ENABLE_CUSTOM_VARIANT)
+      float* s_cache_ptr = params.s_cache; 
+      int64_t* ragged_indices_ptr = params.ragged_indices;
       const uint32_t ext_dim = params.ext_dim;
       const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
       const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
@@ -1941,8 +1943,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       // 2. 初始化共享内存
       // 每个线程从自己的唯一ID开始，以整个块的大小为步长进行遍历
       // 这样就保证了每个 'i' 在第一次被访问时，只会被一个唯一的线程写入。
-      const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
-      const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
       #pragma unroll
       for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
           smem_max_scores[i] = -INFINITY;
@@ -2048,17 +2048,25 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       
       #if defined(ENABLE_CUSTOM_VARIANT)
         // 将 tile 上的 score 更新到 全局内存中
-        float* s_cache_ptr = params.s_cache; 
         // float* w_cache_ptr = params.w_cache; 
-        if (s_cache_ptr != nullptr) {
+        if (s_cache_ptr != nullptr && ragged_indices_ptr != nullptr) {
           #pragma unroll
           for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-            if (i < chunk_size) {
-              const uint32_t global_kv_idx = kv_indptr[request_idx] + chunk_start + iter * CTA_TILE_KV + i;
-              const uint32_t s_offset = global_kv_idx * ext_dim; // s_cache_dim = 1
-              atomicMax(&s_cache_ptr[s_offset], smem_max_scores[i]);
+            const uint32_t logical_kv_idx_in_chunk = iter * CTA_TILE_KV + i;
+
+            if (logical_kv_idx_in_chunk < chunk_size) { // <-- Correct Boundary Check
+              // Calculate the absolute logical index of the token within its sequence
+              const uint32_t logical_kv_idx_in_seq = chunk_start + logical_kv_idx_in_chunk;
+              // Find the starting position for this request in the `ragged_indices` array
+              const uint32_t request_start_idx = kv_indptr[request_idx];
+              // Use the indirection array to get the global token ID
+              const int64_t global_token_id = ragged_indices_ptr[request_start_idx + logical_kv_idx_in_seq];
+              // Calculate the final offset into the score cache
+              const uint32_t s_offset = (global_token_id * num_kv_heads + kv_head_idx) * ext_dim;
+
+              // atomicMax(&s_cache_ptr[s_offset], smem_max_scores[i]);
+              s_cache_ptr[s_offset] += 1;
             }
-            smem_max_scores[i] = -INFINITY; // 重置共享内存中的分数，以便下一次迭代使用
           }
         }
         // 3. 同步，确保所有写入都已完成
@@ -2218,6 +2226,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
     #if defined(ENABLE_CUSTOM_VARIANT)
+      float* s_cache_ptr = params.s_cache; 
+      int64_t* ragged_indices_ptr = params.ragged_indices;
       const uint32_t ext_dim = params.ext_dim;
       const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
       const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
@@ -2383,8 +2393,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // 2. 初始化共享内存
       // 每个线程从自己的唯一ID开始，以整个块的大小为步长进行遍历
       // 这样就保证了每个 'i' 在第一次被访问时，只会被一个唯一的线程写入。
-      const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
-      const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
       #pragma unroll
       for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
           smem_max_scores[i] = -INFINITY;
@@ -2533,7 +2541,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       
       #if defined(ENABLE_CUSTOM_VARIANT)
         // 将 tile 上的 score 更新到 全局内存中
-        float* s_cache_ptr = params.s_cache; 
+        // float* s_cache_ptr = params.s_cache; 
         // float* w_cache_ptr = params.w_cache; 
         if (s_cache_ptr != nullptr) {
           #pragma unroll
@@ -2544,7 +2552,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
               page_iter += paged_kv.indptr[request_idx];
               const uint32_t s_offset = paged_kv.protective_get_kv_offset(
                   page_iter, kv_head_idx, entry_idx, 0, last_indptr) / HEAD_DIM_QK * ext_dim; // s_cache_dim = 1
-              atomicMax(&s_cache_ptr[s_offset], smem_max_scores[i]);
+              // atomicMax(&s_cache_ptr[s_offset], smem_max_scores[i]);
+              s_cache_ptr[s_offset] += 1;
             }
             smem_max_scores[i] = -INFINITY; // 重置共享内存中的分数，以便下一次迭代使用
           }

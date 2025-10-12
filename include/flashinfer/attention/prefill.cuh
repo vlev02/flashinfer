@@ -1815,14 +1815,19 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
     #if defined(ENABLE_CUSTOM_VARIANT)
-      float* s_cache_ptr = params.s_cache; 
+      float* s_cache_ptr = params.s_cache;
+      float* w_cache_ptr = params.w_cache;
       int64_t* ragged_indices_ptr = params.ragged_indices;
       const uint32_t ext_dim = params.ext_dim;
+      const uint32_t q_win_size = params.q_win_size;
+      const float update_rate = params.update_rate;
       const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
       const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
-      // 1. 在共享内存中声明一个用于块内归约的数组
+      // 1. 在共享内存中声明两个独立的数组
       // CTA_TILE_KV 是一个KV-tile中的token数量
-      __shared__ float smem_max_scores[CTA_TILE_KV];
+      __shared__ float smem_max_scores[CTA_TILE_KV];  // For recording attention scores
+      __shared__ float smem_w_cache[CTA_TILE_KV];     // For w_cache values (logit modification)
+      __shared__ uint32_t smem_boundary_idx;          // Boundary: optimization for early exit
     #endif
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -1940,15 +1945,59 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       block.sync();
 
     #if defined(ENABLE_CUSTOM_VARIANT)
-      // 2. 初始化共享内存
-      // 每个线程从自己的唯一ID开始，以整个块的大小为步长进行遍历
-      // 这样就保证了每个 'i' 在第一次被访问时，只会被一个唯一的线程写入。
+      // 2. Initialize shared memory arrays and boundary index
+      if (tid_ == 0) {
+        smem_boundary_idx = CTA_TILE_KV;  // Default: all tokens need modifying
+      }
+
+      // Initialize smem_scores for recording
       #pragma unroll
       for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-          smem_max_scores[i] = -INFINITY;
+        smem_max_scores[i] = 0; //-INFINITY;
       }
-      // 3. 同步，确保所有写入都已完成
-      block.sync(); // __syncthreads();
+      block.sync();
+
+      // Cooperatively load w_cache values and detect boundary
+      if (w_cache_ptr != nullptr && ragged_indices_ptr != nullptr) {
+        uint32_t local_boundary = CTA_TILE_KV;
+
+        #pragma unroll
+        for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+          const uint32_t logical_kv_idx_in_chunk = iter * CTA_TILE_KV + i;
+          if (logical_kv_idx_in_chunk < chunk_size) {
+            const uint32_t logical_kv_idx_in_seq = chunk_start + logical_kv_idx_in_chunk;
+            const uint32_t request_start_idx = kv_indptr[request_idx];
+            const int64_t global_token_id = ragged_indices_ptr[request_start_idx + logical_kv_idx_in_seq];
+            const uint32_t w_offset = (global_token_id * num_kv_heads + kv_head_idx) * ext_dim;
+            const float w_value = w_cache_ptr[w_offset];
+
+            smem_w_cache[i] = w_value;
+
+            // Detect boundary (first token with w_cache < 0)
+            if (w_value < 0.0f) {
+              local_boundary = min(local_boundary, i);
+              smem_w_cache[i] = 0.0f;
+            }
+          } else {
+            smem_w_cache[i] = 0.0f;  // Out-of-bounds padding
+          }
+        }
+
+        // Reduce to find global boundary
+        if (local_boundary < CTA_TILE_KV) {
+          atomicMin(&smem_boundary_idx, local_boundary);
+        }
+      } else {
+        // If w_cache not available, initialize to zero
+        #pragma unroll
+        for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+          smem_w_cache[i] = 0.0f;
+        }
+        if (tid_ == 0) {
+          smem_boundary_idx = 0;  // All tokens need recording
+        }
+      }
+      block.sync();
     #endif
 
       if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -1971,6 +2020,93 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
           qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
+      /*********************************************************************************
+       * BEGIN: CUSTOM MODIFICATION - ADD W_CACHE TO LOGITS
+       *********************************************************************************/
+      #if defined(ENABLE_CUSTOM_VARIANT)
+      // Add w_cache values from shared memory to logits (only for modification region)
+      {
+        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
+
+        // Early exit if all tokens are in recording region
+        if (boundary > 0) {
+          #pragma unroll
+          for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+          #pragma unroll
+              for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
+          #pragma unroll
+                  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+                      // Calculate local KV index
+                      const uint32_t local_kv_idx = warp_idx_kv_bias +
+                                                    (mma_kv * 16) +
+                                                    (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
+
+                      // Only modify logits for tokens before boundary (w_cache >= 0)
+                      if (local_kv_idx < boundary) {
+                          s_frag[mma_q][mma_kv][reg_id] += smem_w_cache[local_kv_idx];
+                      }
+                  }
+              }
+          }
+        }
+      }
+      #endif
+      /*********************************************************************************
+       * END: CUSTOM MODIFICATION - ADD W_CACHE TO LOGITS
+       *********************************************************************************/
+
+      /*********************************************************************************
+       * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
+       *********************************************************************************/
+      #if defined(ENABLE_CUSTOM_VARIANT)
+      {
+        // Record attention scores to shared memory (only for last q_win_size queries)
+        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
+        const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
+
+        // Early exit if all tokens are in modification region (boundary == CTA_TILE_KV)
+        if (boundary < CTA_TILE_KV) {
+          #pragma unroll
+          for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+              // Check if this MMA tile contains queries in the recording window
+              const uint32_t mma_q_start = qo_packed_idx_base + mma_q * 16;
+              const bool should_record = (mma_q_start < qo_len) && (mma_q_start + 16 > recording_start);
+
+              if (should_record) {
+          #pragma unroll
+                  for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
+          #pragma unroll
+                      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+                          const uint32_t local_kv_idx = warp_idx_kv_bias +
+                                                        (mma_kv * 16) +
+                                                        (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
+
+                          // Record logits for queries in the last q_win_size window
+                          if (local_kv_idx < CTA_TILE_KV) {
+                              const float score = s_frag[mma_q][mma_kv][reg_id];
+
+                              // Atomic Add operation on shared memory
+                              if (score > -INFINITY) {
+                                  atomicAdd(&smem_max_scores[local_kv_idx], score);
+                                  // atomicAdd(&smem_max_scores[local_kv_idx], 1.0f); // debug
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+        }
+        block.sync();  // Ensure all atomicAdd operations complete
+
+        // After sync, smem_scores[i] contains sum of scores for KV tokens
+      }
+      #endif
+      /*********************************************************************************
+       * END: CUSTOM MODIFICATION
+       *********************************************************************************/
+
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
         logits_mask<KTraits>(
@@ -1978,55 +2114,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
             chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
             qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
       }
-
-      /*********************************************************************************
-       * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
-       *********************************************************************************/
-      #if defined(ENABLE_CUSTOM_VARIANT)
-      {
-        // 3. 每个线程遍历自己的s_frag, 将分数聚合到共享内存
-        //    首先，获取当前线程所属的warp在KV维度上的ID
-        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
-
-        #pragma unroll
-        for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-        #pragma unroll
-            for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
-        #pragma unroll
-                for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-                    
-                    // ======================== [修正的核心代码] ========================
-                    // 计算当前分数对应的KV-token在当前KV-tile内的局部索引。
-                    // 这个公式组合了warp的ID、MMA块的ID以及线程/寄存器的ID，
-                    // 得到一个在 [0, CTA_TILE_KV - 1] 范围内的唯一索引。
-                    const uint32_t local_kv_idx = warp_idx_kv_bias + 
-                                                  (mma_kv * 16) + 
-                                                  (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
-                    // =================================================================
-
-                    // 从寄存器中获取已经经过缩放和掩码的logits分数
-                    const float score = s_frag[mma_q][mma_kv][reg_id];
-
-                    // 关键：在共享内存上执行原子Max操作，这非常快
-                    // 只有当分数不是负无穷（即未被掩码）时才进行操作
-                    if (score > -INFINITY && local_kv_idx < CTA_TILE_KV) {
-                        // 使用计算出的局部索引来更新共享内存中正确的位置
-                        atomicMax(&smem_max_scores[local_kv_idx], score);
-                    }
-                }
-            }
-        }
-        // // 确保所有线程的atomicMax操作都已完成，这样smem_max_scores中的值才是最终的块内最大值
-        // block.sync();
-
-        // 在这里，smem_max_scores[i] 中就保存了当前KV-tile中第i个token，
-        // 与当前Q-tile中所有token交互后的最大分数。
-        // 接下来可以将其写入全局内存的临时缓冲区。
-      }
-      #endif
-      /*********************************************************************************
-       * END: CUSTOM MODIFICATION
-       *********************************************************************************/
 
       // compute m,d states in online softmax
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
@@ -2047,30 +2134,100 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       cp_async::commit_group();
       
       #if defined(ENABLE_CUSTOM_VARIANT)
-        // 将 tile 上的 score 更新到 全局内存中
-        // float* w_cache_ptr = params.w_cache; 
-        if (s_cache_ptr != nullptr && ragged_indices_ptr != nullptr) {
+        // Write recorded scores back to global memory (only for recording region)
+        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t norm_min_size = 4;
+        const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
+
+        if (s_cache_ptr != nullptr && ragged_indices_ptr != nullptr && boundary < CTA_TILE_KV && tile_size >= norm_min_size) {
+          // Single-pass calculation: compute E[x] and E[x²] simultaneously
+          float local_sum = 0.0f;
+          float local_sum_sq = 0.0f;
+          uint32_t local_count = 0;
+
+          for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+            const uint32_t logical_kv_idx_in_chunk = iter * CTA_TILE_KV + i;
+            if (logical_kv_idx_in_chunk < chunk_size && i >= boundary) {
+              float score = smem_max_scores[i];
+              local_sum += score;
+              local_sum_sq += score * score;
+              local_count++;
+            }
+          }
+
+          // Warp-level reduction for better performance
+          const uint32_t warp_id = tid_ / 32;
+          const uint32_t lane_id = tid_ % 32;
+          const uint32_t num_warps = (block_size + 31) / 32;
+
+          // Intra-warp reduction using shuffle
+          #pragma unroll
+          for (int offset = 16; offset > 0; offset /= 2) {
+            local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+            local_sum_sq += __shfl_down_sync(0xffffffff, local_sum_sq, offset);
+            local_count += __shfl_down_sync(0xffffffff, local_count, offset);
+          }
+
+          // Inter-warp reduction using shared memory (only lane 0 of each warp participates)
+          __shared__ float smem_warp_sum[32];
+          __shared__ float smem_warp_sum_sq[32];
+          __shared__ uint32_t smem_warp_count[32];
+
+          if (lane_id == 0) {
+            smem_warp_sum[warp_id] = local_sum;
+            smem_warp_sum_sq[warp_id] = local_sum_sq;
+            smem_warp_count[warp_id] = local_count;
+          }
+          block.sync();
+
+          // Final reduction by first warp
+          if (warp_id == 0) {
+            local_sum = (lane_id < num_warps) ? smem_warp_sum[lane_id] : 0.0f;
+            local_sum_sq = (lane_id < num_warps) ? smem_warp_sum_sq[lane_id] : 0.0f;
+            local_count = (lane_id < num_warps) ? smem_warp_count[lane_id] : 0;
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+              local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+              local_sum_sq += __shfl_down_sync(0xffffffff, local_sum_sq, offset);
+              local_count += __shfl_down_sync(0xffffffff, local_count, offset);
+            }
+
+            if (lane_id == 0) {
+              smem_warp_sum[0] = local_sum;
+              smem_warp_sum_sq[0] = local_sum_sq;
+              smem_warp_count[0] = local_count;
+            }
+          }
+          block.sync();
+
+          // Compute mean and std using Var(X) = E[X²] - (E[X])²
+          const float total_count = (float)smem_warp_count[0];
+          const float mean = total_count > 0.0f ? smem_warp_sum[0] / total_count : 0.0f;
+          const float mean_sq = total_count > 0.0f ? smem_warp_sum_sq[0] / total_count : 0.0f;
+          const float variance = mean_sq - mean * mean;
+          const float std = sqrtf(fmaxf(variance, 0.0f) + 1e-6f);  // Clamp negative variance due to numerical errors
+
+          // Normalize and write scores
+          const float inv_std = 1.0f / std;  // Pre-compute reciprocal
           #pragma unroll
           for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
             const uint32_t logical_kv_idx_in_chunk = iter * CTA_TILE_KV + i;
 
-            if (logical_kv_idx_in_chunk < chunk_size) { // <-- Correct Boundary Check
-              // Calculate the absolute logical index of the token within its sequence
+            if (logical_kv_idx_in_chunk < chunk_size && i >= boundary) {
               const uint32_t logical_kv_idx_in_seq = chunk_start + logical_kv_idx_in_chunk;
-              // Find the starting position for this request in the `ragged_indices` array
               const uint32_t request_start_idx = kv_indptr[request_idx];
-              // Use the indirection array to get the global token ID
               const int64_t global_token_id = ragged_indices_ptr[request_start_idx + logical_kv_idx_in_seq];
-              // Calculate the final offset into the score cache
               const uint32_t s_offset = (global_token_id * num_kv_heads + kv_head_idx) * ext_dim;
 
-              // atomicMax(&s_cache_ptr[s_offset], smem_max_scores[i]);
-              s_cache_ptr[s_offset] += 1;
+              // Apply z-score normalization: (score - mean) * inv_std
+              float normalized_score = (smem_max_scores[i] - mean) * inv_std;
+              float old_val = s_cache_ptr[s_offset];
+              s_cache_ptr[s_offset] = update_rate * normalized_score + (1 - update_rate) * old_val;
             }
           }
         }
-        // 3. 同步，确保所有写入都已完成
-        block.sync(); // __syncthreads();
+        block.sync();
       #endif
     }
     cp_async::wait_group<0>();
@@ -2226,14 +2383,19 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
     #if defined(ENABLE_CUSTOM_VARIANT)
-      float* s_cache_ptr = params.s_cache; 
+      float* s_cache_ptr = params.s_cache;
+      float* w_cache_ptr = params.w_cache;
       int64_t* ragged_indices_ptr = params.ragged_indices;
       const uint32_t ext_dim = params.ext_dim;
+      const uint32_t q_win_size = params.q_win_size;
+      const float update_rate = params.update_rate;
       const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
       const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
-      // 1. 在共享内存中声明一个用于块内归约的数组
+      // 1. 在共享内存中声明两个独立的数组
       // CTA_TILE_KV 是一个KV-tile中的token数量
-      __shared__ float smem_max_scores[CTA_TILE_KV];
+      __shared__ float smem_max_scores[CTA_TILE_KV];  // For recording attention scores
+      __shared__ float smem_w_cache[CTA_TILE_KV];     // For w_cache values (logit modification)
+      __shared__ uint32_t smem_boundary_idx;          // Boundary: optimization for early exit
     #endif
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -2390,15 +2552,51 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       packed_page_iter_base += (1 + prefetch_skip_step) * CTA_TILE_KV;
 
     #if defined(ENABLE_CUSTOM_VARIANT)
-      // 2. 初始化共享内存
-      // 每个线程从自己的唯一ID开始，以整个块的大小为步长进行遍历
-      // 这样就保证了每个 'i' 在第一次被访问时，只会被一个唯一的线程写入。
+      // Initialize shared memory and boundary index (paged KV variant)
+      if (tid_ == 0) {
+        smem_boundary_idx = CTA_TILE_KV;  // Default: all tokens need modifying
+      }
+
+      // Initialize smem_scores for recording
       #pragma unroll
       for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-          smem_max_scores[i] = -INFINITY;
+        smem_max_scores[i] = 0; //-INFINITY;
       }
-      // 3. 同步，确保所有写入都已完成
-      block.sync(); // __syncthreads();
+      block.sync();
+
+      // Cooperatively load w_cache values and detect boundary (paged KV variant)
+      if (w_cache_ptr != nullptr) {
+        uint32_t local_boundary = CTA_TILE_KV;
+
+        #pragma unroll
+        for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+          if (i < chunk_size) {
+            uint32_t page_iter, entry_idx;
+            paged_kv.page_size.divmod(chunk_start + iter * CTA_TILE_KV + i, page_iter, entry_idx);
+            page_iter += paged_kv.indptr[request_idx];
+            const uint32_t w_offset = paged_kv.protective_get_kv_offset(
+                page_iter, kv_head_idx, entry_idx, 0, last_indptr) / HEAD_DIM_QK * ext_dim;
+            const float w_value = w_cache_ptr[w_offset];
+
+            smem_w_cache[i] = w_value;
+
+            if (w_value < 0.0f) {
+              // Recording region
+              local_boundary = min(local_boundary, i);
+              smem_w_cache[i] = 0.0f;
+            }
+          }
+        }
+
+        if (local_boundary < CTA_TILE_KV) {
+          atomicMin(&smem_boundary_idx, local_boundary);
+        }
+      } else {
+        if (tid_ == 0) {
+          smem_boundary_idx = 0;
+        }
+      }
+      block.sync();
     #endif
 
 #pragma unroll
@@ -2431,6 +2629,92 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
           qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
+
+      /*********************************************************************************
+       * BEGIN: CUSTOM MODIFICATION - ADD W_CACHE TO LOGITS
+       *********************************************************************************/
+      #if defined(ENABLE_CUSTOM_VARIANT)
+      // Add w_cache values from shared memory to logits (paged KV variant)
+      {
+        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
+
+        // Early exit if all tokens are in recording region
+        if (boundary > 0) {
+          #pragma unroll
+          for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+          #pragma unroll
+              for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
+          #pragma unroll
+                  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+                      const uint32_t local_kv_idx = warp_idx_kv_bias +
+                                                    (mma_kv * 16) +
+                                                    (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
+
+                      // Only modify logits for tokens before boundary (w_cache >= 0)
+                      if (local_kv_idx < boundary) {
+                          s_frag[mma_q][mma_kv][reg_id] += smem_w_cache[local_kv_idx];
+                      }
+                  }
+              }
+          }
+        }
+      }
+      #endif
+      /*********************************************************************************
+       * END: CUSTOM MODIFICATION - ADD W_CACHE TO LOGITS
+       *********************************************************************************/
+
+      /*********************************************************************************
+       * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
+       *********************************************************************************/
+      #if defined(ENABLE_CUSTOM_VARIANT)
+      {
+        // Record attention scores to shared memory (only for last q_win_size queries)
+        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
+        const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
+
+        // Early exit if all tokens are in modification region (boundary == CTA_TILE_KV)
+        if (boundary < CTA_TILE_KV) {
+          #pragma unroll
+          for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+              // Check if this MMA tile contains queries in the recording window
+              const uint32_t mma_q_start = qo_packed_idx_base + mma_q * 16;
+              const bool should_record = (mma_q_start < qo_len) && (mma_q_start + 16 > recording_start);
+
+              if (should_record) {
+          #pragma unroll
+                  for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
+          #pragma unroll
+                      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+                          const uint32_t local_kv_idx = warp_idx_kv_bias +
+                                                        (mma_kv * 16) +
+                                                        (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
+
+                          // Record logits for queries in the last q_win_size window
+                          if (local_kv_idx < CTA_TILE_KV) {
+                              const float score = s_frag[mma_q][mma_kv][reg_id];
+
+                              // Atomic Add operation on shared memory
+                              if (score > -INFINITY) {
+                                  atomicAdd(&smem_max_scores[local_kv_idx], score);
+                                  // atomicAdd(&smem_max_scores[local_kv_idx], 1.0f); // debug
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+        }
+        block.sync();  // Ensure all atomicAdd operations complete
+
+        // After sync, smem_scores[i] contains sum of scores for KV tokens
+      }
+      #endif
+      /*********************************************************************************
+       * END: CUSTOM MODIFICATION
+       *********************************************************************************/
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom) {
@@ -2468,57 +2752,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           }
         }
       }
-
-      /*********************************************************************************
-       * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
-       *********************************************************************************/
-      #if defined(ENABLE_CUSTOM_VARIANT)
-      {
-        // 3. 每个线程遍历自己的s_frag, 将分数聚合到共享内存
-        //    首先，获取当前线程所属的warp在KV维度上的ID
-        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
-        assert(local_kv_idx < CTA_TILE_KV);
-
-        #pragma unroll
-        for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-        #pragma unroll
-            for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
-        #pragma unroll
-                for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-                    
-                    // ======================== [修正的核心代码] ========================
-                    // 计算当前分数对应的KV-token在当前KV-tile内的局部索引。
-                    // 这个公式组合了warp的ID、MMA块的ID以及线程/寄存器的ID，
-                    // 得到一个在 [0, CTA_TILE_KV - 1] 范围内的唯一索引。
-                    const uint32_t local_kv_idx = warp_idx_kv_bias + 
-                                                  (mma_kv * 16) + 
-                                                  (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
-                    // =================================================================
-
-                    // 从寄存器中获取已经经过缩放和掩码的logits分数
-                    const float score = s_frag[mma_q][mma_kv][reg_id];
-
-                    // 关键：在共享内存上执行原子Max操作，这非常快
-                    // 只有当分数不是负无穷（即未被掩码）时才进行操作
-                    if (score > -INFINITY) {
-                        // 使用计算出的局部索引来更新共享内存中正确的位置
-                        atomicMax(&smem_max_scores[local_kv_idx], score);
-                    }
-                }
-            }
-        }
-        // // 确保所有线程的atomicMax操作都已完成，这样smem_max_scores中的值才是最终的块内最大值
-        // block.sync();
-
-        // 在这里，smem_max_scores[i] 中就保存了当前KV-tile中第i个token，
-        // 与当前Q-tile中所有token交互后的最大分数。
-        // 接下来可以将其写入全局内存的临时缓冲区。
-      }
-      #endif
-      /*********************************************************************************
-       * END: CUSTOM MODIFICATION
-       *********************************************************************************/
-
+      
       // compute m,d states in online softmax
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
@@ -2540,26 +2774,98 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       cp_async::commit_group();
       
       #if defined(ENABLE_CUSTOM_VARIANT)
-        // 将 tile 上的 score 更新到 全局内存中
-        // float* s_cache_ptr = params.s_cache; 
-        // float* w_cache_ptr = params.w_cache; 
-        if (s_cache_ptr != nullptr) {
+        // Write recorded scores back to global memory (only for recording region)
+        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t norm_min_size = 4;
+        const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
+
+        if (s_cache_ptr != nullptr && boundary < CTA_TILE_KV && tile_size >= norm_min_size) {
+          // Single-pass calculation: compute E[x] and E[x²] simultaneously
+          float local_sum = 0.0f;
+          float local_sum_sq = 0.0f;
+          uint32_t local_count = 0;
+
+          for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+            if (i < chunk_size && i >= boundary) {
+              float score = smem_max_scores[i];
+              local_sum += score;
+              local_sum_sq += score * score;
+              local_count++;
+            }
+          }
+
+          // Warp-level reduction for better performance
+          const uint32_t warp_id = tid_ / 32;
+          const uint32_t lane_id = tid_ % 32;
+          const uint32_t num_warps = (block_size + 31) / 32;
+
+          // Intra-warp reduction using shuffle
+          #pragma unroll
+          for (int offset = 16; offset > 0; offset /= 2) {
+            local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+            local_sum_sq += __shfl_down_sync(0xffffffff, local_sum_sq, offset);
+            local_count += __shfl_down_sync(0xffffffff, local_count, offset);
+          }
+
+          // Inter-warp reduction using shared memory (only lane 0 of each warp participates)
+          __shared__ float smem_warp_sum[32];
+          __shared__ float smem_warp_sum_sq[32];
+          __shared__ uint32_t smem_warp_count[32];
+
+          if (lane_id == 0) {
+            smem_warp_sum[warp_id] = local_sum;
+            smem_warp_sum_sq[warp_id] = local_sum_sq;
+            smem_warp_count[warp_id] = local_count;
+          }
+          block.sync();
+
+          // Final reduction by first warp
+          if (warp_id == 0) {
+            local_sum = (lane_id < num_warps) ? smem_warp_sum[lane_id] : 0.0f;
+            local_sum_sq = (lane_id < num_warps) ? smem_warp_sum_sq[lane_id] : 0.0f;
+            local_count = (lane_id < num_warps) ? smem_warp_count[lane_id] : 0;
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+              local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+              local_sum_sq += __shfl_down_sync(0xffffffff, local_sum_sq, offset);
+              local_count += __shfl_down_sync(0xffffffff, local_count, offset);
+            }
+
+            if (lane_id == 0) {
+              smem_warp_sum[0] = local_sum;
+              smem_warp_sum_sq[0] = local_sum_sq;
+              smem_warp_count[0] = local_count;
+            }
+          }
+          block.sync();
+
+          // Compute mean and std using Var(X) = E[X²] - (E[X])²
+          const float total_count = (float)smem_warp_count[0];
+          const float mean = total_count > 0.0f ? smem_warp_sum[0] / total_count : 0.0f;
+          const float mean_sq = total_count > 0.0f ? smem_warp_sum_sq[0] / total_count : 0.0f;
+          const float variance = mean_sq - mean * mean;
+          const float std = sqrtf(fmaxf(variance, 0.0f) + 1e-6f);  // Clamp negative variance due to numerical errors
+
+          // Normalize and write scores
+          const float inv_std = 1.0f / std;  // Pre-compute reciprocal
           #pragma unroll
           for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-            if (i < chunk_size) {
+            if (i < chunk_size && i >= boundary) {
               uint32_t page_iter, entry_idx;
               paged_kv.page_size.divmod(chunk_start + iter * CTA_TILE_KV + i, page_iter, entry_idx);
               page_iter += paged_kv.indptr[request_idx];
               const uint32_t s_offset = paged_kv.protective_get_kv_offset(
-                  page_iter, kv_head_idx, entry_idx, 0, last_indptr) / HEAD_DIM_QK * ext_dim; // s_cache_dim = 1
-              // atomicMax(&s_cache_ptr[s_offset], smem_max_scores[i]);
-              s_cache_ptr[s_offset] += 1;
+                  page_iter, kv_head_idx, entry_idx, 0, last_indptr) / HEAD_DIM_QK * ext_dim;
+
+              // Apply z-score normalization: (score - mean) * inv_std
+              float normalized_score = (smem_max_scores[i] - mean) * inv_std;
+              float old_val = s_cache_ptr[s_offset];
+              s_cache_ptr[s_offset] = update_rate * normalized_score + (1 - update_rate) * old_val;
             }
-            smem_max_scores[i] = -INFINITY; // 重置共享内存中的分数，以便下一次迭代使用
           }
         }
-        // 3. 同步，确保所有写入都已完成
-        block.sync(); // __syncthreads();
+        block.sync();
       #endif
     }
     cp_async::wait_group<0>();

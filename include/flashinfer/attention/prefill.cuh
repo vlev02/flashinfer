@@ -1818,16 +1818,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       float* s_cache_ptr = params.s_cache;
       float* w_cache_ptr = params.w_cache;
       int64_t* ragged_indices_ptr = params.ragged_indices;
+      int64_t* prefix_cache_lens_ptr = params.prefix_cache_lens;
       const uint32_t ext_dim = params.ext_dim;
       const uint32_t q_win_size = params.q_win_size;
       const float update_rate = params.update_rate;
       const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
       const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
-      // 1. 在共享内存中声明两个独立的数组
-      // CTA_TILE_KV 是一个KV-tile中的token数量
+      // 1. Declare shared memory arrays for custom attention score recording
+      // CTA_TILE_KV is the number of tokens in one KV-tile
       __shared__ float smem_max_scores[CTA_TILE_KV];  // For recording attention scores
-      __shared__ float smem_w_cache[CTA_TILE_KV];     // For w_cache values (logit modification)
-      __shared__ uint32_t smem_boundary_idx;          // Boundary: optimization for early exit
     #endif
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -1945,57 +1944,26 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       block.sync();
 
     #if defined(ENABLE_CUSTOM_VARIANT)
-      // 2. Initialize shared memory arrays and boundary index
-      if (tid_ == 0) {
-        smem_boundary_idx = CTA_TILE_KV;  // Default: all tokens need modifying
-      }
+      // 2. Calculate boundary index (each thread computes independently in register)
+      uint32_t boundary_idx = 0;
+      // // For ragged prefill: boundary = 0 (all tokens recorded)
+      // // For paged prefill: boundary = prefix_cache_lens[request_idx] (only new tokens recorded)
+      // uint32_t boundary_idx;
+      // if (prefix_cache_lens_ptr != nullptr) {
+      //   // Use prefix_cache_lens to determine boundary
+      //   const int64_t prefix_len = prefix_cache_lens_ptr[request_idx];
+      //   // Calculate boundary relative to current chunk
+      //   const int64_t absolute_boundary = max((int64_t)0, prefix_len - (int64_t)chunk_start);
+      //   boundary_idx = min((uint32_t)absolute_boundary, CTA_TILE_KV);
+      // } else {
+      //   // Ragged prefill: all tokens should be recorded
+      //   boundary_idx = 0;
+      // }
 
       // Initialize smem_scores for recording
       #pragma unroll
       for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
         smem_max_scores[i] = 0; //-INFINITY;
-      }
-      block.sync();
-
-      // Cooperatively load w_cache values and detect boundary
-      if (w_cache_ptr != nullptr && ragged_indices_ptr != nullptr) {
-        uint32_t local_boundary = CTA_TILE_KV;
-
-        #pragma unroll
-        for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-          const uint32_t logical_kv_idx_in_chunk = iter * CTA_TILE_KV + i;
-          if (logical_kv_idx_in_chunk < chunk_size) {
-            const uint32_t logical_kv_idx_in_seq = chunk_start + logical_kv_idx_in_chunk;
-            const uint32_t request_start_idx = kv_indptr[request_idx];
-            const int64_t global_token_id = ragged_indices_ptr[request_start_idx + logical_kv_idx_in_seq];
-            const uint32_t w_offset = (global_token_id * num_kv_heads + kv_head_idx) * ext_dim;
-            const float w_value = w_cache_ptr[w_offset];
-
-            smem_w_cache[i] = w_value;
-
-            // Detect boundary (first token with w_cache < 0)
-            if (w_value < 0.0f) {
-              local_boundary = min(local_boundary, i);
-              smem_w_cache[i] = 0.0f;
-            }
-          } else {
-            smem_w_cache[i] = 0.0f;  // Out-of-bounds padding
-          }
-        }
-
-        // Reduce to find global boundary
-        if (local_boundary < CTA_TILE_KV) {
-          atomicMin(&smem_boundary_idx, local_boundary);
-        }
-      } else {
-        // If w_cache not available, initialize to zero
-        #pragma unroll
-        for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-          smem_w_cache[i] = 0.0f;
-        }
-        if (tid_ == 0) {
-          smem_boundary_idx = 0;  // All tokens need recording
-        }
       }
       block.sync();
     #endif
@@ -2021,48 +1989,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
           qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       /*********************************************************************************
-       * BEGIN: CUSTOM MODIFICATION - ADD W_CACHE TO LOGITS
-       *********************************************************************************/
-      #if defined(ENABLE_CUSTOM_VARIANT)
-      // Add w_cache values from shared memory to logits (only for modification region)
-      {
-        const uint32_t boundary = smem_boundary_idx;
-        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
-
-        // Early exit if all tokens are in recording region
-        if (boundary > 0) {
-          #pragma unroll
-          for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-          #pragma unroll
-              for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
-          #pragma unroll
-                  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-                      // Calculate local KV index
-                      const uint32_t local_kv_idx = warp_idx_kv_bias +
-                                                    (mma_kv * 16) +
-                                                    (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
-
-                      // Only modify logits for tokens before boundary (w_cache >= 0)
-                      if (local_kv_idx < boundary) {
-                          s_frag[mma_q][mma_kv][reg_id] += smem_w_cache[local_kv_idx];
-                      }
-                  }
-              }
-          }
-        }
-      }
-      #endif
-      /*********************************************************************************
-       * END: CUSTOM MODIFICATION - ADD W_CACHE TO LOGITS
-       *********************************************************************************/
-
-      /*********************************************************************************
        * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
        *********************************************************************************/
       #if defined(ENABLE_CUSTOM_VARIANT)
       {
         // Record attention scores to shared memory (only for last q_win_size queries)
-        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t boundary = boundary_idx;
         const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
         const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
 
@@ -2135,7 +2067,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       
       #if defined(ENABLE_CUSTOM_VARIANT)
         // Write recorded scores back to global memory (only for recording region)
-        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t boundary = boundary_idx;
         const uint32_t norm_min_size = 4;
         const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
 
@@ -2386,16 +2318,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       float* s_cache_ptr = params.s_cache;
       float* w_cache_ptr = params.w_cache;
       int64_t* ragged_indices_ptr = params.ragged_indices;
+      int64_t* prefix_cache_lens_ptr = params.prefix_cache_lens;
       const uint32_t ext_dim = params.ext_dim;
       const uint32_t q_win_size = params.q_win_size;
       const float update_rate = params.update_rate;
       const uint32_t block_size = blockDim.x * blockDim.y * blockDim.z;
       const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
-      // 1. 在共享内存中声明两个独立的数组
-      // CTA_TILE_KV 是一个KV-tile中的token数量
+      // 1. Declare shared memory arrays for custom attention score recording
+      // CTA_TILE_KV is the number of tokens in one KV-tile
       __shared__ float smem_max_scores[CTA_TILE_KV];  // For recording attention scores
-      __shared__ float smem_w_cache[CTA_TILE_KV];     // For w_cache values (logit modification)
-      __shared__ uint32_t smem_boundary_idx;          // Boundary: optimization for early exit
     #endif
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -2552,49 +2483,25 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       packed_page_iter_base += (1 + prefetch_skip_step) * CTA_TILE_KV;
 
     #if defined(ENABLE_CUSTOM_VARIANT)
-      // Initialize shared memory and boundary index (paged KV variant)
-      if (tid_ == 0) {
-        smem_boundary_idx = CTA_TILE_KV;  // Default: all tokens need modifying
+      // 2. Calculate boundary index (each thread computes independently in register)
+      // For ragged prefill: boundary = 0 (all tokens recorded)
+      // For paged prefill: boundary = prefix_cache_lens[request_idx] (only new tokens recorded)
+      uint32_t boundary_idx;
+      if (prefix_cache_lens_ptr != nullptr) {
+        // Use prefix_cache_lens to determine boundary
+        const int64_t prefix_len = prefix_cache_lens_ptr[request_idx];
+        // Calculate boundary relative to current chunk
+        const int64_t absolute_boundary = max((int64_t)0, prefix_len - (int64_t)(chunk_start + iter * CTA_TILE_KV));
+        boundary_idx = min((uint32_t)absolute_boundary, CTA_TILE_KV);
+      } else {
+        // Ragged prefill: all tokens should be recorded
+        boundary_idx = 0;
       }
 
       // Initialize smem_scores for recording
       #pragma unroll
       for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
         smem_max_scores[i] = 0; //-INFINITY;
-      }
-      block.sync();
-
-      // Cooperatively load w_cache values and detect boundary (paged KV variant)
-      if (w_cache_ptr != nullptr) {
-        uint32_t local_boundary = CTA_TILE_KV;
-
-        #pragma unroll
-        for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-          if (i < chunk_size) {
-            uint32_t page_iter, entry_idx;
-            paged_kv.page_size.divmod(chunk_start + iter * CTA_TILE_KV + i, page_iter, entry_idx);
-            page_iter += paged_kv.indptr[request_idx];
-            const uint32_t w_offset = paged_kv.protective_get_kv_offset(
-                page_iter, kv_head_idx, entry_idx, 0, last_indptr) / HEAD_DIM_QK * ext_dim;
-            const float w_value = w_cache_ptr[w_offset];
-
-            smem_w_cache[i] = w_value;
-
-            if (w_value < 0.0f) {
-              // Recording region
-              local_boundary = min(local_boundary, i);
-              smem_w_cache[i] = 0.0f;
-            }
-          }
-        }
-
-        if (local_boundary < CTA_TILE_KV) {
-          atomicMin(&smem_boundary_idx, local_boundary);
-        }
-      } else {
-        if (tid_ == 0) {
-          smem_boundary_idx = 0;
-        }
       }
       block.sync();
     #endif
@@ -2631,47 +2538,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
       /*********************************************************************************
-       * BEGIN: CUSTOM MODIFICATION - ADD W_CACHE TO LOGITS
-       *********************************************************************************/
-      #if defined(ENABLE_CUSTOM_VARIANT)
-      // Add w_cache values from shared memory to logits (paged KV variant)
-      {
-        const uint32_t boundary = smem_boundary_idx;
-        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
-
-        // Early exit if all tokens are in recording region
-        if (boundary > 0) {
-          #pragma unroll
-          for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
-          #pragma unroll
-              for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
-          #pragma unroll
-                  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-                      const uint32_t local_kv_idx = warp_idx_kv_bias +
-                                                    (mma_kv * 16) +
-                                                    (2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2);
-
-                      // Only modify logits for tokens before boundary (w_cache >= 0)
-                      if (local_kv_idx < boundary) {
-                          s_frag[mma_q][mma_kv][reg_id] += smem_w_cache[local_kv_idx];
-                      }
-                  }
-              }
-          }
-        }
-      }
-      #endif
-      /*********************************************************************************
-       * END: CUSTOM MODIFICATION - ADD W_CACHE TO LOGITS
-       *********************************************************************************/
-
-      /*********************************************************************************
        * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
        *********************************************************************************/
       #if defined(ENABLE_CUSTOM_VARIANT)
       {
         // Record attention scores to shared memory (only for last q_win_size queries)
-        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t boundary = boundary_idx;
         const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
         const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
 
@@ -2775,7 +2647,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       
       #if defined(ENABLE_CUSTOM_VARIANT)
         // Write recorded scores back to global memory (only for recording region)
-        const uint32_t boundary = smem_boundary_idx;
+        const uint32_t boundary = boundary_idx;
         const uint32_t norm_min_size = 4;
         const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
 

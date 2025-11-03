@@ -709,6 +709,7 @@ def gen_batch_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    jit_args: Optional[List] = None,
 ) -> JitSpec:
     uri = get_batch_decode_uri(
         dtype_q,

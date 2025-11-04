@@ -1945,19 +1945,19 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
     #if defined(ENABLE_CUSTOM_VARIANT)
       // 2. Calculate boundary index (each thread computes independently in register)
-      uint32_t boundary_idx = 0;
+      uint32_t boundary = 0;
       // // For ragged prefill: boundary = 0 (all tokens recorded)
       // // For paged prefill: boundary = prefix_cache_lens[request_idx] (only new tokens recorded)
-      // uint32_t boundary_idx;
+      // uint32_t boundary;
       // if (prefix_cache_lens_ptr != nullptr) {
       //   // Use prefix_cache_lens to determine boundary
       //   const int64_t prefix_len = prefix_cache_lens_ptr[request_idx];
       //   // Calculate boundary relative to current chunk
       //   const int64_t absolute_boundary = max((int64_t)0, prefix_len - (int64_t)chunk_start);
-      //   boundary_idx = min((uint32_t)absolute_boundary, CTA_TILE_KV);
+      //   boundary = min((uint32_t)absolute_boundary, CTA_TILE_KV);
       // } else {
       //   // Ragged prefill: all tokens should be recorded
-      //   boundary_idx = 0;
+      //   boundary = 0;
       // }
 
       // Initialize smem_scores for recording
@@ -1993,13 +1993,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
        *********************************************************************************/
       #if defined(ENABLE_CUSTOM_VARIANT)
       {
-        // Record attention scores to shared memory (only for last q_win_size queries)
-        const uint32_t boundary = boundary_idx;
-        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
-        const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
 
         // Early exit if all tokens are in modification region (boundary == CTA_TILE_KV)
         if (boundary < CTA_TILE_KV) {
+          // Record attention scores to shared memory (only for last q_win_size queries)
+          const uint32_t boundary = boundary;
+          const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
+          const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
+
           #pragma unroll
           for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
               // Check if this MMA tile contains queries in the recording window
@@ -2067,7 +2068,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       
       #if defined(ENABLE_CUSTOM_VARIANT)
         // Write recorded scores back to global memory (only for recording region)
-        const uint32_t boundary = boundary_idx;
         const uint32_t norm_min_size = 4;
         const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
 
@@ -2486,16 +2486,16 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // 2. Calculate boundary index (each thread computes independently in register)
       // For ragged prefill: boundary = 0 (all tokens recorded)
       // For paged prefill: boundary = prefix_cache_lens[request_idx] (only new tokens recorded)
-      uint32_t boundary_idx;
+      uint32_t boundary;
       if (prefix_cache_lens_ptr != nullptr) {
         // Use prefix_cache_lens to determine boundary
         const int64_t prefix_len = prefix_cache_lens_ptr[request_idx];
         // Calculate boundary relative to current chunk
         const int64_t absolute_boundary = max((int64_t)0, prefix_len - (int64_t)(chunk_start + iter * CTA_TILE_KV));
-        boundary_idx = min((uint32_t)absolute_boundary, CTA_TILE_KV);
+        boundary = min((uint32_t)absolute_boundary, CTA_TILE_KV);
       } else {
         // Ragged prefill: all tokens should be recorded
-        boundary_idx = 0;
+        boundary = 0;
       }
 
       // Initialize smem_scores for recording
@@ -2543,7 +2543,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       #if defined(ENABLE_CUSTOM_VARIANT)
       {
         // Record attention scores to shared memory (only for last q_win_size queries)
-        const uint32_t boundary = boundary_idx;
+        const uint32_t boundary = boundary;
         const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
         const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
 
@@ -2647,7 +2647,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       
       #if defined(ENABLE_CUSTOM_VARIANT)
         // Write recorded scores back to global memory (only for recording region)
-        const uint32_t boundary = boundary_idx;
         const uint32_t norm_min_size = 4;
         const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
 

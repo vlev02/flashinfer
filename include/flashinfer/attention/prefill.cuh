@@ -1826,7 +1826,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
       // 1. Declare shared memory arrays for custom attention score recording
       // CTA_TILE_KV is the number of tokens in one KV-tile
-      __shared__ float smem_max_scores[CTA_TILE_KV];  // For recording attention scores
+      __shared__ float smem_agg_scores[CTA_TILE_KV];  // For recording attention scores
     #endif
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -1945,27 +1945,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
     #if defined(ENABLE_CUSTOM_VARIANT)
       // 2. Calculate boundary index (each thread computes independently in register)
-      uint32_t boundary = 0;
       // // For ragged prefill: boundary = 0 (all tokens recorded)
       // // For paged prefill: boundary = prefix_cache_lens[request_idx] (only new tokens recorded)
-      // uint32_t boundary;
-      // if (prefix_cache_lens_ptr != nullptr) {
-      //   // Use prefix_cache_lens to determine boundary
-      //   const int64_t prefix_len = prefix_cache_lens_ptr[request_idx];
-      //   // Calculate boundary relative to current chunk
-      //   const int64_t absolute_boundary = max((int64_t)0, prefix_len - (int64_t)chunk_start);
-      //   boundary = min((uint32_t)absolute_boundary, CTA_TILE_KV);
-      // } else {
-      //   // Ragged prefill: all tokens should be recorded
-      //   boundary = 0;
-      // }
+      uint32_t kv_boundary = 0;
 
-      // Initialize smem_scores for recording
-      #pragma unroll
-      for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-        smem_max_scores[i] = 0; //-INFINITY;
+      // Initialize smem_scores for recording (only if q_win_size > 0)
+      if (q_win_size > 0) {
+        #pragma unroll
+        for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+          smem_agg_scores[i] = 0; //-INFINITY;
+        }
+        block.sync();
       }
-      block.sync();
     #endif
 
       if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -1992,14 +1983,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
        * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
        *********************************************************************************/
       #if defined(ENABLE_CUSTOM_VARIANT)
-      {
-
+      if (q_win_size > 0) {
         // Early exit if all tokens are in modification region (boundary == CTA_TILE_KV)
-        if (boundary < CTA_TILE_KV) {
+        if (kv_boundary < CTA_TILE_KV) {
           // Record attention scores to shared memory (only for last q_win_size queries)
-          const uint32_t boundary = boundary;
           const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
-          const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
+          const uint32_t recording_start = (qo_len > q_win_size) ? qo_len - q_win_size : 0;
 
           #pragma unroll
           for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
@@ -2022,8 +2011,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
                               // Atomic Add operation on shared memory
                               if (score > -INFINITY) {
-                                  atomicAdd(&smem_max_scores[local_kv_idx], score);
-                                  // atomicAdd(&smem_max_scores[local_kv_idx], 1.0f); // debug
+                                  atomicAdd(&smem_agg_scores[local_kv_idx], score);
+                                  // atomicAdd(&smem_agg_scores[local_kv_idx], 1.0f); // debug
                               }
                           }
                       }
@@ -2068,10 +2057,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       
       #if defined(ENABLE_CUSTOM_VARIANT)
         // Write recorded scores back to global memory (only for recording region)
-        const uint32_t norm_min_size = 4;
-        const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
+        if (q_win_size > 0) {
+          const uint32_t norm_min_size = 4;
+          const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
 
-        if (s_cache_ptr != nullptr && ragged_indices_ptr != nullptr && boundary < CTA_TILE_KV && tile_size >= norm_min_size) {
+          if (s_cache_ptr != nullptr && ragged_indices_ptr != nullptr && kv_boundary < CTA_TILE_KV && tile_size >= norm_min_size) {
           // Single-pass calculation: compute E[x] and E[x²] simultaneously
           float local_sum = 0.0f;
           float local_sum_sq = 0.0f;
@@ -2079,8 +2069,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
           for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
             const uint32_t logical_kv_idx_in_chunk = iter * CTA_TILE_KV + i;
-            if (logical_kv_idx_in_chunk < chunk_size && i >= boundary) {
-              float score = smem_max_scores[i];
+            if (logical_kv_idx_in_chunk < chunk_size && i >= kv_boundary) {
+              float score = smem_agg_scores[i];
               local_sum += score;
               local_sum_sq += score * score;
               local_count++;
@@ -2146,20 +2136,21 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
           for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
             const uint32_t logical_kv_idx_in_chunk = iter * CTA_TILE_KV + i;
 
-            if (logical_kv_idx_in_chunk < chunk_size && i >= boundary) {
+            if (logical_kv_idx_in_chunk < chunk_size && i >= kv_boundary) {
               const uint32_t logical_kv_idx_in_seq = chunk_start + logical_kv_idx_in_chunk;
               const uint32_t request_start_idx = kv_indptr[request_idx];
               const int64_t global_token_id = ragged_indices_ptr[request_start_idx + logical_kv_idx_in_seq];
               const uint32_t s_offset = (global_token_id * num_kv_heads + kv_head_idx) * ext_dim;
 
               // Apply z-score normalization: (score - mean) * inv_std
-              float normalized_score = (smem_max_scores[i] - mean) * inv_std;
+              float normalized_score = (smem_agg_scores[i] - mean) * inv_std;
               float old_val = s_cache_ptr[s_offset];
               s_cache_ptr[s_offset] = update_rate * normalized_score + (1 - update_rate) * old_val;
             }
           }
         }
         block.sync();
+        }
       #endif
     }
     cp_async::wait_group<0>();
@@ -2326,7 +2317,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       const uint32_t tid_ = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
       // 1. Declare shared memory arrays for custom attention score recording
       // CTA_TILE_KV is the number of tokens in one KV-tile
-      __shared__ float smem_max_scores[CTA_TILE_KV];  // For recording attention scores
+      __shared__ float smem_agg_scores[CTA_TILE_KV];  // For recording attention scores
     #endif
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
@@ -2486,24 +2477,26 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // 2. Calculate boundary index (each thread computes independently in register)
       // For ragged prefill: boundary = 0 (all tokens recorded)
       // For paged prefill: boundary = prefix_cache_lens[request_idx] (only new tokens recorded)
-      uint32_t boundary;
+      uint32_t kv_boundary;
       if (prefix_cache_lens_ptr != nullptr) {
         // Use prefix_cache_lens to determine boundary
         const int64_t prefix_len = prefix_cache_lens_ptr[request_idx];
         // Calculate boundary relative to current chunk
         const int64_t absolute_boundary = max((int64_t)0, prefix_len - (int64_t)(chunk_start + iter * CTA_TILE_KV));
-        boundary = min((uint32_t)absolute_boundary, CTA_TILE_KV);
+        kv_boundary = min((uint32_t)absolute_boundary, CTA_TILE_KV);
       } else {
         // Ragged prefill: all tokens should be recorded
-        boundary = 0;
+        kv_boundary = 0;
       }
 
-      // Initialize smem_scores for recording
-      #pragma unroll
-      for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-        smem_max_scores[i] = 0; //-INFINITY;
+      // Initialize smem_scores for recording (only if q_win_size > 0)
+      if (q_win_size > 0) {
+        #pragma unroll
+        for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
+          smem_agg_scores[i] = 0; //-INFINITY;
+        }
+        block.sync();
       }
-      block.sync();
     #endif
 
 #pragma unroll
@@ -2541,14 +2534,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
        * BEGIN: CUSTOM MODIFICATION TO SAVE ATTENTION SCORES
        *********************************************************************************/
       #if defined(ENABLE_CUSTOM_VARIANT)
-      {
-        // Record attention scores to shared memory (only for last q_win_size queries)
-        const uint32_t boundary = boundary;
-        const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
-        const uint32_t recording_start = (qo_len > q_win_size && q_win_size > 0) ? qo_len - q_win_size : 0;
-
+      if (q_win_size > 0) {
         // Early exit if all tokens are in modification region (boundary == CTA_TILE_KV)
-        if (boundary < CTA_TILE_KV) {
+        if (kv_boundary < CTA_TILE_KV) {
+          // Record attention scores to shared memory (only for last q_win_size queries)
+          const uint32_t warp_idx_kv_bias = get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16;
+          const uint32_t recording_start = (qo_len > q_win_size) ? qo_len - q_win_size : 0;
           #pragma unroll
           for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
               // Check if this MMA tile contains queries in the recording window
@@ -2570,8 +2561,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
                               // Atomic Add operation on shared memory
                               if (score > -INFINITY) {
-                                  atomicAdd(&smem_max_scores[local_kv_idx], score);
-                                  // atomicAdd(&smem_max_scores[local_kv_idx], 1.0f); // debug
+                                  atomicAdd(&smem_agg_scores[local_kv_idx], score);
+                                  // atomicAdd(&smem_agg_scores[local_kv_idx], 1.0f); // debug
                               }
                           }
                       }
@@ -2647,18 +2638,19 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       
       #if defined(ENABLE_CUSTOM_VARIANT)
         // Write recorded scores back to global memory (only for recording region)
-        const uint32_t norm_min_size = 4;
-        const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
+        if (q_win_size > 0) {
+          const uint32_t norm_min_size = 4;
+          const uint32_t tile_size = min(CTA_TILE_KV, chunk_size - iter * CTA_TILE_KV);
 
-        if (s_cache_ptr != nullptr && boundary < CTA_TILE_KV && tile_size >= norm_min_size) {
-          // Single-pass calculation: compute E[x] and E[x²] simultaneously
+          if (s_cache_ptr != nullptr && kv_boundary < CTA_TILE_KV && tile_size >= norm_min_size) {
+            // Single-pass calculation: compute E[x] and E[x²] simultaneously
           float local_sum = 0.0f;
           float local_sum_sq = 0.0f;
           uint32_t local_count = 0;
 
           for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-            if (i < chunk_size && i >= boundary) {
-              float score = smem_max_scores[i];
+            if (i < chunk_size && i >= kv_boundary) {
+              float score = smem_agg_scores[i];
               local_sum += score;
               local_sum_sq += score * score;
               local_count++;
@@ -2722,7 +2714,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           const float inv_std = 1.0f / std;  // Pre-compute reciprocal
           #pragma unroll
           for (int i = tid_; i < CTA_TILE_KV; i += block_size) {
-            if (i < chunk_size && i >= boundary) {
+            if (i < chunk_size && i >= kv_boundary) {
               uint32_t page_iter, entry_idx;
               paged_kv.page_size.divmod(chunk_start + iter * CTA_TILE_KV + i, page_iter, entry_idx);
               page_iter += paged_kv.indptr[request_idx];
@@ -2730,13 +2722,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                   page_iter, kv_head_idx, entry_idx, 0, last_indptr) / HEAD_DIM_QK * ext_dim;
 
               // Apply z-score normalization: (score - mean) * inv_std
-              float normalized_score = (smem_max_scores[i] - mean) * inv_std;
+              float normalized_score = (smem_agg_scores[i] - mean) * inv_std;
               float old_val = s_cache_ptr[s_offset];
               s_cache_ptr[s_offset] = update_rate * normalized_score + (1 - update_rate) * old_val;
             }
           }
         }
         block.sync();
+        }
       #endif
     }
     cp_async::wait_group<0>();
